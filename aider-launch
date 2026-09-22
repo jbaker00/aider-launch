@@ -32,6 +32,17 @@ def save_config(config):
         pass
 
 
+def in_git_repo():
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
 def prompt_server(last_server):
     suffix = f" [{last_server}]" if last_server else ""
     entered = input(f"Server{suffix}: ").strip()
@@ -152,8 +163,13 @@ def main():
         "--openai-api-base", base_url,
         "--openai-api-key", "none",
         "--model", f"openai/{chosen_id}",
-        *sys.argv[1:],
     ]
+    if not in_git_repo():
+        # Avoid aider's "no git repo found, create one?" prompt when run from
+        # a directory (like a projects root) that isn't itself a project repo.
+        # Pass --git explicitly (after the launcher's own args) to override.
+        cmd.append("--no-git")
+    cmd += sys.argv[1:]
 
     print(f"Launching aider with {chosen_id} on {server} ...")
     os.execvp(aider, cmd)
