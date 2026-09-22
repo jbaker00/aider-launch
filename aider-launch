@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Interactive launcher: pick a llama.cpp server + model, then exec aider against it."""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+CONFIG_PATH = os.path.expanduser("~/.aider-launch.json")
+DEFAULT_PORT = 8080
+REQUEST_TIMEOUT = 5
+
+
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_config(config):
+    try:
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(config, f, indent=2)
+    except OSError:
+        pass
+
+
+def prompt_server(last_server):
+    suffix = f" [{last_server}]" if last_server else ""
+    entered = input(f"Server{suffix}: ").strip()
+    return entered or last_server
+
+
+def fetch_models(server, port):
+    url = f"http://{server}:{port}/v1/models"
+    try:
+        with urllib.request.urlopen(url, timeout=REQUEST_TIMEOUT) as resp:
+            data = json.load(resp)
+    except urllib.error.URLError as e:
+        print(f"Could not reach {url}: {e}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"Unexpected error reaching {url}: {e}", file=sys.stderr)
+        return None
+    return data.get("data", [])
+
+
+def describe_model(m):
+    status = m.get("status", {}).get("value", "unknown")
+    meta = m.get("meta") or {}
+    params = meta.get("n_params")
+    ftype = meta.get("ftype")
+    bits = []
+    if params:
+        bits.append(f"{params / 1e9:.1f}B params")
+    if ftype:
+        bits.append(ftype)
+    detail = ", ".join(bits)
+    tag = "loaded" if status == "loaded" else "cold"
+    return tag, detail
+
+
+def sort_models(models):
+    return sorted(models, key=lambda m: (m.get("status", {}).get("value") != "loaded", m.get("id", "")))
+
+
+def select_with_fzf(models):
+    fzf = shutil.which("fzf")
+    if not fzf:
+        return None
+    lines = []
+    for m in models:
+        tag, detail = describe_model(m)
+        marker = "*" if tag == "loaded" else " "
+        extra = f"  ({detail})" if detail else ""
+        lines.append(f"{marker} {m['id']}{extra}")
+    input_text = "\n".join(lines)
+    try:
+        result = subprocess.run(
+            [fzf, "--prompt=model> ", "--height=~15", "--reverse",
+             "--header=* = already loaded (starts instantly), others cold-load on first use"],
+            input=input_text, text=True, capture_output=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    chosen_line = result.stdout.strip()
+    for m in models:
+        if chosen_line.lstrip("* ").startswith(m["id"]):
+            return m["id"]
+    return None
+
+
+def select_with_prompt(models):
+    print()
+    for i, m in enumerate(models, 1):
+        tag, detail = describe_model(m)
+        marker = "*" if tag == "loaded" else " "
+        extra = f"  ({detail})" if detail else ""
+        print(f" {marker} {i}. {m['id']}{extra}")
+    print()
+    print(" * = already loaded (starts instantly); others cold-load on first use")
+    while True:
+        choice = input("Pick a model number: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(models):
+            return models[int(choice) - 1]["id"]
+        print("Invalid choice, try again.")
+
+
+def main():
+    config = load_config()
+    last_server = config.get("last_server", "beelink1")
+    last_model = config.get("last_model")
+
+    server = prompt_server(last_server)
+    if not server:
+        print("No server given, exiting.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Fetching model list from {server}:{DEFAULT_PORT} ...")
+    models = fetch_models(server, DEFAULT_PORT)
+    if not models:
+        print("No models found (server unreachable or empty model list).", file=sys.stderr)
+        sys.exit(1)
+
+    models = sort_models(models)
+
+    chosen_id = select_with_fzf(models)
+    if not chosen_id:
+        chosen_id = select_with_prompt(models)
+
+    config["last_server"] = server
+    config["last_model"] = chosen_id
+    save_config(config)
+
+    aider = shutil.which("aider")
+    if not aider:
+        print("aider not found on PATH.", file=sys.stderr)
+        sys.exit(1)
+
+    base_url = f"http://{server}:{DEFAULT_PORT}/v1"
+    cmd = [
+        aider,
+        "--openai-api-base", base_url,
+        "--openai-api-key", "none",
+        "--model", f"openai/{chosen_id}",
+        *sys.argv[1:],
+    ]
+
+    print(f"Launching aider with {chosen_id} on {server} ...")
+    os.execvp(aider, cmd)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
